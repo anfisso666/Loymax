@@ -17,6 +17,7 @@ from typing import Dict, Tuple, List
 import warnings
 warnings.filterwarnings('ignore')
 
+# part_1
 class NetworkWeightedOutcomeEstimation:
     """
     Класс для анализа Network-based Weighted Outcome Estimation (NWOE)
