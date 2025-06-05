@@ -16,8 +16,999 @@ import loymax as lm
 from typing import Dict, Tuple, List
 import warnings
 warnings.filterwarnings('ignore')
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats
+from scipy.stats import pearsonr
+from sklearn.preprocessing import RobustScaler, StandardScaler
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.metrics import r2_score, mean_squared_error, accuracy_score
+from sklearn.decomposition import PCA
+from statsmodels.stats.weightstats import ttest_ind
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools.tools import add_constant
+from typing import Dict, Tuple, List
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor
+from scipy import stats
 
-# part_1
+# Попытка импорта pylift с обработкой ошибок
+try:
+    from pylift.eval import UpliftEval
+    from pylift import TransformedOutcome
+    PYLIFT_AVAILABLE = True
+except ImportError:
+    PYLIFT_AVAILABLE = False
+    print("⚠️  PyLift не найден. Используются альтернативные методы.")
+
+# Проверяем доступность PyLift
+try:
+    from pylift import TransformedOutcome
+    PYLIFT_AVAILABLE = True
+except ImportError:
+    PYLIFT_AVAILABLE = False
+    print("⚠️ PyLift не установлен. Некоторые функции будут недоступны.")
+
+try:
+    import statsmodels.api as sm
+    from statsmodels.regression.linear_model import OLS
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    STATSMODELS_AVAILABLE = False
+    print("⚠️ Statsmodels не установлен. Используем альтернативные методы.")
+
+
+class ATENIVAnalyzer:
+    """
+    Анализатор для оценки среднего эффекта воздействия (ATE) 
+    с помощью NIV (Net Information Value) на данных A/B-тестов
+    """
+    
+    def __init__(self, data: pd.DataFrame, 
+                 treatment_col: str = 'treatment',
+                 outcome_col: str = 'conversion',
+                 feature_cols: List[str] = None):
+        """
+        Инициализация анализатора
+        
+        Args:
+            data: DataFrame с данными
+            treatment_col: название столбца с индикатором воздействия
+            outcome_col: название столбца с целевой переменной
+            feature_cols: список названий столбцов с признаками
+        """
+        self.data = data.copy()
+        self.treatment_col = treatment_col
+        self.outcome_col = outcome_col
+        
+        # Автоматически определяем признаки если не указаны
+        if feature_cols is None:
+            self.feature_cols = [f'f{i}' for i in range(12)]  # f0-f11
+        else:
+            self.feature_cols = feature_cols
+            
+        # Дополнительные переменные для IV анализа
+        self.network_vars = ['visit', 'exposure'] if 'visit' in data.columns and 'exposure' in data.columns else []
+        
+        print(f"Инициализация анализатора:")
+        print(f"   Размер данных: {data.shape}")
+        print(f"   Столбец воздействия: {treatment_col}")
+        print(f"   Столбец исхода: {outcome_col}")
+        print(f"   Количество признаков: {len(self.feature_cols)}")
+        print(f"   Инструментальные переменные: {self.network_vars}")
+    
+    def calculate_niv(self, feature_col: str, n_bins: int = 10) -> Dict:
+        """
+        Расчет Net Information Value (NIV) для признака
+        
+        Args:
+            feature_col: название столбца с признаком
+            n_bins: количество бинов для разбиения
+            
+        Returns:
+            Dict с результатами NIV анализа
+        """
+        try:
+            # Создаем бины для непрерывных переменных
+            feature_values = self.data[feature_col].copy()
+            
+            # Если переменная непрерывная, разбиваем на бины
+            if len(feature_values.unique()) > n_bins:
+                feature_binned = pd.cut(feature_values, bins=n_bins, duplicates='drop')
+            else:
+                feature_binned = feature_values
+            
+            # Создаем таблицу контингентности
+            contingency_table = pd.crosstab(
+                feature_binned, 
+                [self.data[self.treatment_col], self.data[self.outcome_col]]
+            )
+            
+            # Вычисляем NIV для каждой группы
+            niv_results = {}
+            total_treated = self.data[self.data[self.treatment_col] == 1].shape[0]
+            total_control = self.data[self.data[self.treatment_col] == 0].shape[0]
+            
+            for bin_value in contingency_table.index:
+                # Получаем частоты для данного бина
+                treated_pos = contingency_table.loc[bin_value, (1, 1)] if (1, 1) in contingency_table.columns else 0
+                treated_neg = contingency_table.loc[bin_value, (1, 0)] if (1, 0) in contingency_table.columns else 0
+                control_pos = contingency_table.loc[bin_value, (0, 1)] if (0, 1) in contingency_table.columns else 0
+                control_neg = contingency_table.loc[bin_value, (0, 0)] if (0, 0) in contingency_table.columns else 0
+                
+                # Избегаем деления на ноль
+                if treated_pos + treated_neg == 0 or control_pos + control_neg == 0:
+                    continue
+                
+                # Вычисляем rates
+                treated_rate = treated_pos / (treated_pos + treated_neg) if (treated_pos + treated_neg) > 0 else 0
+                control_rate = control_pos / (control_pos + control_neg) if (control_pos + control_neg) > 0 else 0
+                
+                # Веса групп
+                treated_weight = (treated_pos + treated_neg) / total_treated if total_treated > 0 else 0
+                control_weight = (control_pos + control_neg) / total_control if total_control > 0 else 0
+                
+                # NIV для данного бина
+                if control_rate > 0 and treated_rate > 0:
+                    niv_bin = (treated_rate - control_rate) * np.log(treated_rate / control_rate)
+                else:
+                    niv_bin = 0
+                
+                niv_results[str(bin_value)] = {
+                    'treated_rate': treated_rate,
+                    'control_rate': control_rate,
+                    'treated_weight': treated_weight,
+                    'control_weight': control_weight,
+                    'niv': niv_bin,
+                    'lift': treated_rate - control_rate
+                }
+            
+            # Суммарный NIV
+            total_niv = sum([result['niv'] * result['treated_weight'] for result in niv_results.values()])
+            
+            return {
+                'feature': feature_col,
+                'total_niv': total_niv,
+                'bin_results': niv_results,
+                'n_bins': len(niv_results)
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка при расчете NIV для {feature_col}: {e}")
+            return {'feature': feature_col, 'total_niv': 0, 'bin_results': {}, 'n_bins': 0}
+    
+    def calculate_ate_simple(self) -> Dict:
+        """
+        Простой расчет ATE (разность средних)
+        """
+        treated_outcome = self.data[self.data[self.treatment_col] == 1][self.outcome_col].mean()
+        control_outcome = self.data[self.data[self.treatment_col] == 0][self.outcome_col].mean()
+        
+        ate = treated_outcome - control_outcome
+        
+        # Стандартная ошибка
+        treated_var = self.data[self.data[self.treatment_col] == 1][self.outcome_col].var()
+        control_var = self.data[self.data[self.treatment_col] == 0][self.outcome_col].var()
+        n_treated = self.data[self.data[self.treatment_col] == 1].shape[0]
+        n_control = self.data[self.data[self.treatment_col] == 0].shape[0]
+        
+        se = np.sqrt(treated_var / n_treated + control_var / n_control)
+        
+        # t-статистика
+        t_stat = ate / se if se > 0 else 0
+        p_value = 2 * (1 - stats.t.cdf(abs(t_stat), n_treated + n_control - 2))
+        
+        return {
+            'ate': ate,
+            'se': se,
+            't_stat': t_stat,
+            'p_value': p_value,
+            'ci_lower': ate - 1.96 * se,
+            'ci_upper': ate + 1.96 * se,
+            'treated_mean': treated_outcome,
+            'control_mean': control_outcome
+        }
+    
+    def two_stage_least_squares(self, instrument: str, sample_size: int = None) -> Dict:
+        """
+        Двухшаговый МНК с исправленным доступом к параметрам
+        """
+        if not STATSMODELS_AVAILABLE:
+            return self._two_stage_sklearn(instrument, sample_size)
+        
+        try:
+            data_sample = self.data.sample(n=sample_size) if sample_size else self.data
+            
+            # Первая стадия: treatment ~ instrument + controls
+            X_first_stage = sm.add_constant(data_sample[self.feature_cols + [instrument]])
+            first_stage = OLS(data_sample[self.treatment_col], X_first_stage).fit()
+            
+            # Получаем предсказанные значения treatment
+            treatment_hat = first_stage.fittedvalues
+            
+            # Вторая стадия: outcome ~ treatment_hat + controls
+            X_second_stage = sm.add_constant(pd.concat([treatment_hat, data_sample[self.feature_cols]], axis=1))
+            second_stage = OLS(data_sample[self.outcome_col], X_second_stage).fit()
+            
+            # Исправленный доступ к параметрам
+            param_names = second_stage.params.index
+            treatment_param_name = param_names[1]  # Первый после константы
+            
+            ate_estimate = second_stage.params[treatment_param_name]
+            ate_se = second_stage.bse[treatment_param_name]
+            
+            # F-статистика для проверки слабости инструмента
+            f_stat = first_stage.fvalue
+            
+            return {
+                'ate': ate_estimate,
+                'se': ate_se,
+                't_stat': ate_estimate / ate_se if ate_se > 0 else 0,
+                'p_value': 2 * (1 - stats.t.cdf(abs(ate_estimate / ate_se), len(data_sample) - len(self.feature_cols) - 2)) if ate_se > 0 else 1,
+                'first_stage_f': f_stat,
+                'weak_instrument': f_stat < 10,
+                'instrument': instrument
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка в 2SLS для {instrument}: {e}")
+            return self._two_stage_sklearn(instrument, sample_size)
+    
+    def _two_stage_sklearn(self, instrument: str, sample_size: int = None) -> Dict:
+        """
+        Альтернативная реализация 2SLS через sklearn
+        """
+        try:
+            data_sample = self.data.sample(n=sample_size) if sample_size else self.data
+            
+            # Первая стадия
+            X_first = data_sample[self.feature_cols + [instrument]]
+            y_first = data_sample[self.treatment_col]
+            
+            first_stage = LinearRegression()
+            first_stage.fit(X_first, y_first)
+            treatment_hat = first_stage.predict(X_first)
+            
+            # Вторая стадия
+            X_second = np.column_stack([treatment_hat, data_sample[self.feature_cols]])
+            y_second = data_sample[self.outcome_col]
+            
+            second_stage = LinearRegression()
+            second_stage.fit(X_second, y_second)
+            
+            ate_estimate = second_stage.coef_[0]  # Коэффициент при treatment_hat
+            
+            # Простая оценка стандартной ошибки
+            residuals = y_second - second_stage.predict(X_second)
+            mse = np.mean(residuals**2)
+            ate_se = np.sqrt(mse / len(data_sample))
+            
+            return {
+                'ate': ate_estimate,
+                'se': ate_se,
+                't_stat': ate_estimate / ate_se if ate_se > 0 else 0,
+                'p_value': 2 * (1 - stats.t.cdf(abs(ate_estimate / ate_se), len(data_sample) - len(self.feature_cols) - 2)) if ate_se > 0 else 1,
+                'first_stage_f': None,
+                'weak_instrument': False,
+                'instrument': instrument
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка в sklearn 2SLS для {instrument}: {e}")
+            return {'ate': 0, 'se': 1, 't_stat': 0, 'p_value': 1, 'instrument': instrument}
+    
+    def pylift_analysis(self, sample_size: int = None) -> Dict:
+        """
+        Анализ с помощью PyLift
+        """
+        if not PYLIFT_AVAILABLE:
+            print("⚠️ PyLift недоступен")
+            return {}
+        
+        try:
+            data_sample = self.data.sample(n=sample_size) if sample_size else self.data
+            
+            # Подготовка данных для PyLift
+            X = data_sample[self.feature_cols]
+            y = data_sample[self.outcome_col]
+            treatment = data_sample[self.treatment_col]
+            
+            # Создаем модель TransformedOutcome
+            to_model = TransformedOutcome(X, y, treatment)
+            to_model.fit()
+            
+            # Получаем предсказания
+            predictions = to_model.predict(X)
+            
+            # Вычисляем ATE
+            ate = predictions.mean()
+            
+            return {
+                'ate': ate,
+                'method': 'PyLift TransformedOutcome',
+                'predictions': predictions,
+                'model_score': to_model.score(X, y, treatment) if hasattr(to_model, 'score') else None
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка в PyLift анализе: {e}")
+            return {}
+    # ..
+    def comprehensive_niv_ate_analysis(self, sample_size: int = None) -> Dict:
+        """
+        Комплексный анализ ATE с использованием NIV
+        """
+        print("🔬 Начинаем комплексный NIV-ATE анализ...")
+        
+        results = {}
+        
+        # 1. Простой ATE
+        print("\n1️. Простой расчет ATE...")
+        simple_ate = self.calculate_ate_simple()
+        results['simple_ate'] = simple_ate
+        print(f"   ATE: {simple_ate['ate']:.6f} (SE: {simple_ate['se']:.6f}, p-value: {simple_ate['p_value']:.4f})")
+        
+        # 2. NIV для всех признаков
+        print("\n2️. Расчет NIV для всех признаков...")
+        niv_results = {}
+        for feature in self.feature_cols:
+    #         if feature in self.data.columns:
+                niv_result = self.calculate_niv(feature)
+                niv_results[feature] = niv_result
+                print(f"   {feature}: NIV = {niv_result['total_niv']:.6f}")
+        
+        results['niv_analysis'] = niv_results
+        
+        # 3. Ранжирование признаков по NIV
+        niv_ranking = sorted(niv_results.items(), key=lambda x: abs(x[1]['total_niv']), reverse=True)
+        results['niv_ranking'] = niv_ranking
+        
+        print("\nТоп-5 признаков по NIV:")
+        for i, (feature, niv_data) in enumerate(niv_ranking[:5]):
+            print(f"   {i+1}. {feature}: {niv_data['total_niv']:.6f}")
+        
+        # 4. Инструментальные переменные (если доступны)
+        if self.network_vars:
+            print("\n3️. Анализ с инструментальными переменными...")
+            iv_results = {}
+            for instrument in self.network_vars:
+                if instrument in self.data.columns:
+                    iv_result = self.two_stage_least_squares(instrument, sample_size)
+                    iv_results[instrument] = iv_result
+                    print(f"   {instrument}: ATE = {iv_result['ate']:.6f} (SE: {iv_result['se']:.6f})")
+            
+            results['iv_analysis'] = iv_results
+        
+        # 5. PyLift анализ (если доступен)
+        if PYLIFT_AVAILABLE:
+            print("\n4️. PyLift анализ...")
+            pylift_result = self.pylift_analysis(sample_size)
+            if pylift_result:
+                results['pylift_analysis'] = pylift_result
+                print(f"   PyLift ATE: {pylift_result['ate']:.6f}")
+        
+        # 6. Сводка результатов
+        print("\n📋 Сводка результатов:")
+        print(f"   Простой ATE: {simple_ate['ate']:.6f}")
+        
+        if 'iv_analysis' in results:
+            for instrument, iv_result in results['iv_analysis'].items():
+                print(f"   2SLS ({instrument}): {iv_result['ate']:.6f}")
+        
+        if 'pylift_analysis' in results and results['pylift_analysis']:
+            print(f"   PyLift ATE: {results['pylift_analysis']['ate']:.6f}")
+        
+        return results
+
+class PyLiftNetworkAnalyzer:
+    """
+    Класс для анализа Network-based Weighted Outcome Estimation (NWOE) 
+    с использованием PyLift
+    """
+    
+    def __init__(self, data: pd.DataFrame, treatment_col: str = 'treatment', 
+                 outcome_col: str = 'conversion', network_vars: List[str] = ['visit', 'exposure']):
+        self.data = data.copy()
+        self.treatment_col = treatment_col
+        self.outcome_col = outcome_col
+        self.network_vars = network_vars
+        self.feature_cols = [col for col in data.columns 
+                           if col.startswith('f') and col not in [treatment_col, outcome_col] + network_vars]
+        
+        # Проверка наличия необходимых колонок
+        required_cols = [treatment_col, outcome_col] + network_vars
+        missing_cols = [col for col in required_cols if col not in data.columns]
+        if missing_cols:
+            raise ValueError(f"Отсутствуют колонки: {missing_cols}")
+        
+        print(f"Инициализация PyLiftNetworkAnalyzer:")
+        print(f"   Размер данных: {self.data.shape}")
+        print(f"   Фичи: {len(self.feature_cols)}")
+        print(f"   Сетевые переменные: {self.network_vars}")
+    
+    def calculate_network_weights(self, method: str = 'exposure_based') -> np.ndarray:
+        """Вычисление весов на основе сетевых переменных"""
+        
+        if method == 'exposure_based':
+            # Веса на основе exposure
+            weights = 1 + self.data['exposure'].values
+            
+        elif method == 'visit_based':
+            # Веса на основе visit
+            weights = 1 + self.data['visit'].values
+            
+        elif method == 'combined':
+            # Комбинированные веса
+            exposure_norm = self.data['exposure'] / (self.data['exposure'].max() + 1e-8)
+            visit_norm = self.data['visit'] / (self.data['visit'].max() + 1e-8)
+            weights = 1 + 0.5 * (exposure_norm + visit_norm)
+            
+        elif method == 'inverse_variance':
+            # Обратные веса дисперсии
+            network_score = self.data['exposure'] + self.data['visit']
+            network_var = np.var(network_score)
+            if network_var > 0:
+                weights = 1 / (1 + network_var * np.abs(network_score))
+            else:
+                weights = np.ones(len(self.data))
+            
+        else:
+            weights = np.ones(len(self.data))
+            
+        # Нормализация весов
+        weights = weights / (weights.sum() + 1e-8) * len(weights)
+        return weights
+    # ..
+    def pylift_transformed_outcome_analysis(self, sample_size: int = None) -> Dict:# origin
+        """
+        Анализ с использованием Transformed Outcome подхода из PyLift
+        """
+        if not PYLIFT_AVAILABLE:
+            return self._alternative_transformed_outcome_analysis(sample_size)
+        
+        print("Запуск PyLift Transformed Outcome анализа...")
+        
+        # Подготовка данных
+        if sample_size and len(self.data) > sample_size:
+            sample_data = self.data.sample(n=sample_size, random_state=42)
+            print(f"📊 Используется выборка: {len(sample_data):,} из {len(self.data):,}")
+        else:
+            sample_data = self.data
+        
+        # Подготовка фичей с сетевыми переменными
+        X_features = sample_data[self.feature_cols + self.network_vars].copy()
+        
+        # Заполнение пропущенных значений
+        X_features = X_features.fillna(X_features.median())
+        
+        try:
+            # Создание Transformed Outcome модели
+            to_model = TransformedOutcome(
+                df=sample_data,
+                col_treatment=self.treatment_col,
+                col_outcome=self.outcome_col,
+                col_features=list(X_features.columns)
+            )
+            
+            # Обучение модели
+            to_model.fit()
+            
+            # Получение предсказаний uplift
+            uplift_predictions = to_model.predict(X_features)
+            
+            # Вычисление ATE как среднего uplift
+            ate_estimate = np.mean(uplift_predictions)
+            
+            print(f"✅ PyLift Transformed Outcome ATE: {ate_estimate:.6f}")
+            
+            return {
+                'ate_estimate': ate_estimate,
+                'uplift_predictions': uplift_predictions,
+                'model': to_model,
+                'method': 'pylift_transformed_outcome',
+                'sample_size': len(sample_data)
+            }
+            
+        except Exception as e:
+            return self._alternative_transformed_outcome_analysis(sample_size)
+    
+    def _alternative_transformed_outcome_analysis(self, sample_size: int = None) -> Dict:# альтерн
+        """
+        Альтернативная реализация Transformed Outcome без PyLift
+        """
+        
+        # Подготовка данных
+        if sample_size and len(self.data) > sample_size:
+            sample_data = self.data.sample(n=sample_size, random_state=42)
+        else:
+            sample_data = self.data
+        
+        # Подготовка фичей
+        X = sample_data[self.feature_cols + self.network_vars].fillna(0)
+        treatment = sample_data[self.treatment_col]
+        outcome = sample_data[self.outcome_col]
+        
+        # Создание transformed outcome
+        # TO = Y * T / p(T=1|X) - Y * (1-T) / p(T=0|X)
+        
+        # Оценка пропенсити скоров
+        prop_model = LogisticRegression(random_state=42, max_iter=1000)
+        prop_model.fit(X, treatment)
+        propensity_scores = prop_model.predict_proba(X)[:, 1]
+        propensity_scores = np.clip(propensity_scores, 0.01, 0.99)
+        
+        # Вычисление transformed outcome
+        transformed_outcome = (
+            outcome * treatment / propensity_scores - 
+            outcome * (1 - treatment) / (1 - propensity_scores)
+        )
+        
+        # Модель для предсказания transformed outcome
+        to_model = RandomForestRegressor(n_estimators=100, random_state=42)
+        to_model.fit(X, transformed_outcome)
+        
+        # Предсказания uplift
+        uplift_predictions = to_model.predict(X)
+        
+        # ATE как среднее uplift
+        ate_estimate = np.mean(uplift_predictions)
+        
+        print(f"Transformed Outcome ATE: {ate_estimate:.6f}")
+        
+        return {
+            'ate_estimate': ate_estimate,
+            'uplift_predictions': uplift_predictions,
+            'transformed_outcome': transformed_outcome,
+            'propensity_model': prop_model,
+            'uplift_model': to_model,
+            'method': 'alternative_transformed_outcome',
+            'sample_size': len(sample_data)
+        }
+    
+    def pylift_evaluation_metrics(self, uplift_predictions: np.ndarray) -> Dict:
+        """
+        Вычисление метрик качества с использованием PyLift
+        """
+        if not PYLIFT_AVAILABLE:
+            return self._alternative_evaluation_metrics(uplift_predictions)
+        
+        try:
+            # Подготовка данных для оценки
+            eval_data = self.data.copy()
+            eval_data['uplift_pred'] = uplift_predictions
+            
+            # Создание объекта для оценки
+            evaluator = UpliftEval(
+                treatment_col=self.treatment_col,
+                outcome_col=self.outcome_col,
+                prediction_col='uplift_pred'
+            )
+            
+            # Вычисление метрик
+            metrics = evaluator.evaluate(eval_data)
+            
+            return {
+                'pylift_metrics': metrics,
+                'method': 'pylift_evaluation'
+            }
+            
+        except Exception as e:
+            print(f"⚠️  Ошибка в PyLift оценке: {e}")
+            return self._alternative_evaluation_metrics(uplift_predictions)
+    
+    def _alternative_evaluation_metrics(self, uplift_predictions: np.ndarray) -> Dict:
+        """
+        Альтернативные метрики оценки качества
+        """
+        treatment = self.data[self.treatment_col].values
+        outcome = self.data[self.outcome_col].values
+        
+        # Разделение на декили по uplift
+        n_deciles = 10
+        deciles = pd.qcut(uplift_predictions, q=n_deciles, labels=False, duplicates='drop')
+        
+        # Вычисление метрик по декилям
+        decile_metrics = []
+        for i in range(n_deciles):
+            mask = deciles == i
+            if mask.sum() > 0:
+                treated_mask = mask & (treatment == 1)
+                control_mask = mask & (treatment == 0)
+                
+                if treated_mask.sum() > 0 and control_mask.sum() > 0:
+                    treated_rate = outcome[treated_mask].mean()
+                    control_rate = outcome[control_mask].mean()
+                    lift = treated_rate - control_rate
+                    
+                    decile_metrics.append({
+                        'decile': i,
+                        'size': mask.sum(),
+                        'treated_rate': treated_rate,
+                        'control_rate': control_rate,
+                        'lift': lift
+                    })
+        
+        # Общие метрики
+        overall_metrics = {
+            'mean_uplift_prediction': np.mean(uplift_predictions),
+            'std_uplift_prediction': np.std(uplift_predictions),
+            'decile_metrics': decile_metrics
+        }
+        
+        return {
+            'alternative_metrics': overall_metrics,
+            'method': 'alternative_evaluation'
+        }
+    
+    def network_weighted_pylift_analysis(self, sample_size: int = None) -> Dict:
+        """
+        Комбинированный анализ с сетевыми весами и PyLift
+        """
+        print("🕸️  Запуск Network-Weighted PyLift анализа...")
+        
+        # Подготовка данных
+        if sample_size and len(self.data) > sample_size:
+            sample_data = self.data.sample(n=sample_size, random_state=42)
+        else:
+            sample_data = self.data
+        
+        results = {}
+        
+        # 1. Базовый PyLift анализ
+        pylift_result = self.pylift_transformed_outcome_analysis(sample_size)
+        results['base_pylift'] = pylift_result
+        
+        # 2. Анализ с различными сетевыми весами
+        weight_methods = ['exposure_based', 'visit_based', 'combined']
+        
+        for method in weight_methods:
+            print(f"   Анализ с весами: {method}")
+            
+            # Вычисление весов
+            weights = self.calculate_network_weights(method)
+            
+            if sample_size and len(self.data) > sample_size:
+                weights = weights[:len(sample_data)]
+            
+            # Взвешенная оценка ATE
+            treatment = sample_data[self.treatment_col].values
+            outcome = sample_data[self.outcome_col].values
+            
+            treated_outcomes = outcome[treatment == 1]
+            control_outcomes = outcome[treatment == 0]
+            treated_weights = weights[treatment == 1]
+            control_weights = weights[treatment == 0]
+            
+            if len(treated_outcomes) > 0 and len(control_outcomes) > 0:
+                weighted_ate = (
+                    np.average(treated_outcomes, weights=treated_weights) - 
+                    np.average(control_outcomes, weights=control_weights)
+                )
+                
+                results[f'weighted_{method}'] = {
+                    'ate_estimate': weighted_ate,
+                    'weights': weights,
+                    'method': f'network_weighted_{method}'
+                }
+        
+        # 3. Комбинированная оценка
+        all_ates = [result['ate_estimate'] for result in results.values() 
+                   if 'ate_estimate' in result]
+        
+        if all_ates:
+            combined_ate = np.mean(all_ates)
+            ate_std = np.std(all_ates)
+            
+            results['combined'] = {
+                'ate_estimate': combined_ate,
+                'ate_std': ate_std,
+                'individual_estimates': all_ates,
+                'method': 'combined_network_pylift'
+            }
+            
+            print(f"✅ Комбинированная оценка ATE: {combined_ate:.6f} ± {ate_std:.6f}")
+        
+        return results
+
+class NetworkInstrumentalVariablesPyLift:
+    """
+    Класс для анализа Network Instrumental Variables (NIV) с PyLift
+    """
+    
+    def __init__(self, data: pd.DataFrame, treatment_col: str = 'treatment', 
+                 outcome_col: str = 'conversion', network_vars: List[str] = ['visit', 'exposure']):
+        self.data = data.copy()
+        self.treatment_col = treatment_col
+        self.outcome_col = outcome_col
+        self.network_vars = network_vars
+        self.feature_cols = [col for col in data.columns 
+                           if col.startswith('f') and col not in [treatment_col, outcome_col] + network_vars]
+        
+        print(f"Инициализация NIV анализа:")
+        print(f"   Инструменты: {self.network_vars}")
+        print(f"   Фичи: {len(self.feature_cols)}")
+    
+    def check_instrument_validity(self) -> Dict:
+        """Проверка валидности инструментальных переменных"""
+        results = {}
+        
+        print("🔍 Проверка валидности инструментов...")
+        
+        for iv in self.network_vars:
+            print(f"   Анализ инструмента: {iv}")
+            
+            # 1. Релевантность: корреляция IV с treatment
+            relevance = self.data[iv].corr(self.data[self.treatment_col])
+            
+            # 2. Эксклюзивность: частная корреляция IV с outcome при контроле treatment
+            # Используем остатки от регрессии outcome на treatment
+            X_treatment = add_constant(self.data[self.treatment_col])
+            outcome_model = OLS(self.data[self.outcome_col], X_treatment).fit()
+            outcome_residuals = outcome_model.resid
+            
+            exclusivity = self.data[iv].corr(outcome_residuals)
+            
+            # 3. F-статистика для проверки силы инструмента
+            X_iv = add_constant(self.data[iv])
+            first_stage = OLS(self.data[self.treatment_col], X_iv).fit()
+            f_stat = first_stage.fvalue
+            
+            # 4. Дополнительные тесты
+            iv_treatment_r2 = first_stage.rsquared
+            
+            results[iv] = {
+                'relevance': relevance,
+                'exclusivity': abs(exclusivity),
+                'f_statistic': f_stat,
+                'first_stage_r2': iv_treatment_r2,
+                'weak_instrument': f_stat < 10,  # Правило Staiger-Stock
+                'first_stage_model': first_stage
+            }
+            
+            print(f"      Релевантность: {relevance:.4f}")
+            print(f"      Эксклюзивность: {abs(exclusivity):.4f}")
+            print(f"      F-статистика: {f_stat:.2f}")
+            print(f"      Слабый инструмент: {'Да' if f_stat < 10 else 'Нет'}")
+        
+        return results
+    
+    def two_stage_least_squares(self, instrument: str, sample_size: int = None) -> Dict:
+        """
+        Двухэтапный метод наименьших квадратов (2SLS)
+        """
+        print(f"🎯 2SLS анализ с инструментом: {instrument}")
+        
+        # Подготовка данных
+        if sample_size and len(self.data) > sample_size:
+            sample_data = self.data.sample(n=sample_size, random_state=42)
+        else:
+            sample_data = self.data
+        
+        # Подготовка переменных
+        X_controls = sample_data[self.feature_cols].fillna(0)
+        instrument_var = sample_data[instrument]
+        treatment = sample_data[self.treatment_col]
+        outcome = sample_data[self.outcome_col]
+        
+        # Этап 1: Регрессия treatment на инструмент и контроли
+        X_first_stage = add_constant(pd.concat([instrument_var, X_controls], axis=1))
+        first_stage = OLS(treatment, X_first_stage).fit()
+        treatment_fitted = first_stage.fittedvalues
+        
+        # Этап 2: Регрессия outcome на fitted treatment и контроли
+        X_second_stage = add_constant(pd.concat([treatment_fitted, X_controls], axis=1))
+        second_stage = OLS(outcome, X_second_stage).fit()
+        
+        # ATE - это коэффициент при treatment в второй стадии
+        ate_estimate = second_stage.params[1]  # Первый параметр после константы
+        ate_se = second_stage.bse[1]
+        
+        print(f"   2SLS ATE: {ate_estimate:.6f} (SE: {ate_se:.6f})")
+        
+        return {
+            'ate_estimate': ate_estimate,
+            'ate_se': ate_se,
+            'first_stage_model': first_stage,
+            'second_stage_model': second_stage,
+            'first_stage_r2': first_stage.rsquared,
+            'second_stage_r2': second_stage.rsquared,
+            'instrument': instrument,
+            'method': '2sls',
+            'sample_size': len(sample_data)
+        }
+    
+    def pylift_instrumental_analysis(self, sample_size: int = None) -> Dict:
+        """
+        Комбинированный анализ NIV с PyLift методами
+        """
+        print("🔬 PyLift Instrumental Variables анализ...")
+        
+        results = {}
+        
+        # 1. Проверка валидности инструментов
+        iv_validity = self.check_instrument_validity()
+        results['instrument_validity'] = iv_validity
+        
+        # 2. 2SLS для каждого инструмента
+        for instrument in self.network_vars:
+            if not iv_validity[instrument]['weak_instrument']:
+                tsls_result = self.two_stage_least_squares(instrument, sample_size)
+                results[f'2sls_{instrument}'] = tsls_result
+            else:
+                print(f"⚠️  Пропуск слабого инструмента: {instrument}")
+        
+        # 3. Альтернативный подход через PyLift
+        if PYLIFT_AVAILABLE:
+            try:
+                # Используем инструменты как дополнительные фичи
+                pylift_analyzer = PyLiftNetworkAnalyzer(
+                    self.data, self.treatment_col, self.outcome_col, self.network_vars
+                )
+                
+                pylift_result = pylift_analyzer.pylift_transformed_outcome_analysis(sample_size)
+                results['pylift_instrumental'] = pylift_result
+                
+            except Exception as e:
+                print(f"⚠️  Ошибка в PyLift instrumental анализе: {e}")
+        
+        return results
+
+def comprehensive_pylift_ate_analysis(data: pd.DataFrame, sample_size: int = None) -> Dict:
+    """
+    Комплексный анализ ATE с использованием PyLift и сетевых эффектов
+    """
+    print("🚀 КОМПЛЕКСНЫЙ PYLIFT ATE АНАЛИЗ")
+    print("=" * 50)
+    
+    results = {}
+    
+    # 1. Базовые оценки
+    print("📊 Базовые оценки...")
+    naive_ate = (data[data['treatment'] == 1]['conversion'].mean() - 
+                data[data['treatment'] == 0]['conversion'].mean())
+    results['naive_ate'] = naive_ate
+    print(f"   Наивная оценка ATE: {naive_ate:.6f}")
+    
+    # 2. PyLift Network анализ
+    print("\n🕸️  PyLift Network анализ...")
+    network_analyzer = PyLiftNetworkAnalyzer(data)
+    pylift_results = network_analyzer.network_weighted_pylift_analysis(sample_size)
+    results['pylift_network'] = pylift_results
+    
+    # 3. NIV анализ с PyLift
+    print("\n🎯 Network Instrumental Variables анализ...")
+    niv_analyzer = NetworkInstrumentalVariablesPyLift(data)
+    niv_results = niv_analyzer.pylift_instrumental_analysis(sample_size)
+    results['niv_analysis'] = niv_results
+    
+    # 4. Сравнение методов
+    print("\n📈 Сравнение всех методов:")
+    all_estimates = {'Наивная оценка': naive_ate}
+    
+    # Добавляем PyLift оценки
+    if 'combined' in pylift_results:
+        all_estimates['PyLift Combined'] = pylift_results['combined']['ate_estimate']
+    
+    if 'base_pylift' in pylift_results:
+        all_estimates['PyLift Base'] = pylift_results['base_pylift']['ate_estimate']
+    
+    # Добавляем 2SLS оценки
+    for key, value in niv_results.items():
+        if key.startswith('2sls_') and 'ate_estimate' in value:
+            instrument = key.replace('2sls_', '')
+            all_estimates[f'2SLS ({instrument})'] = value['ate_estimate']
+    
+    # Вывод результатов
+    for method, estimate in all_estimates.items():
+        print(f"   {method:20}: {estimate:8.6f}")
+    
+    # Статистики
+    if len(all_estimates) > 1:
+        estimates_values = list(all_estimates.values())
+        mean_estimate = np.mean(estimates_values)
+        std_estimate = np.std(estimates_values)
+        
+        print(f"\n📊 Статистики:")
+        print(f"   Среднее: {mean_estimate:.6f}")
+        print(f"   Std: {std_estimate:.6f}")
+        print(f"   Диапазон: {np.max(estimates_values) - np.min(estimates_values):.6f}")
+        
+        results['summary'] = {
+            'all_estimates': all_estimates,
+            'mean_estimate': mean_estimate,
+            'std_estimate': std_estimate,
+            'range': np.max(estimates_values) - np.min(estimates_values)
+        }
+    
+    # 5. Рекомендации
+    print("\n💡 Рекомендации:")
+    
+    if 'pylift_network' in results and 'combined' in results['pylift_network']:
+        recommended_ate = results['pylift_network']['combined']['ate_estimate']
+        recommended_std = results['pylift_network']['combined']['ate_std']
+        
+        print(f"   Рекомендуемая оценка ATE: {recommended_ate:.6f} ± {recommended_std:.6f}")
+        print(f"   Метод: Комбинированный PyLift с сетевыми весами")
+        
+        results['recommendation'] = {
+            'ate_estimate': recommended_ate,
+            'ate_std': recommended_std,
+            'method': 'Combined PyLift Network-Weighted'
+        }
+    
+    return results
+
+def quick_pylift_analysis(data: pd.DataFrame, sample_size: int = 50000) -> Dict:
+    """
+    Быстрый PyLift анализ для больших датасетов
+    """
+    print("⚡ БЫСТРЫЙ PYLIFT АНАЛИЗ")
+    print("=" * 30)
+    
+    # 1. Наивная оценка
+    naive_ate = (data[data['treatment'] == 1]['conversion'].mean() - 
+                data[data['treatment'] == 0]['conversion'].mean())
+    print(f"📊 Наивная оценка: {naive_ate:.6f}")
+    
+    # 2. Быстрый PyLift анализ
+    analyzer = PyLiftNetworkAnalyzer(data)
+    
+    # Transformed Outcome
+    to_result = analyzer.pylift_transformed_outcome_analysis(sample_size)
+    
+    # Network-weighted анализ
+    network_result = analyzer.network_weighted_pylift_analysis(sample_size)
+    
+    results = {
+        'naive_ate': naive_ate,
+        'transformed_outcome': to_result['ate_estimate'],
+        'network_weighted': network_result.get('combined', {}).get('ate_estimate', 'N/A')
+    }
+    
+    print(f"📊 Результаты:")
+    for method, estimate in results.items():
+        if isinstance(estimate, (int, float)):
+            print(f"   {method}: {estimate:.6f}")
+        else:
+            print(f"   {method}: {estimate}")
+    
+    return {
+        'quick_estimates': results,
+        'detailed_results': {
+            'transformed_outcome': to_result,
+            'network_weighted': network_result
+        }
+    }
+
+# Функции для диагностики и визуализации остаются теми же
+def network_effects_diagnostics(data: pd.DataFrame) -> Dict:
+    """Диагностика сетевых эффектов"""
+    
+    print("\n🔬 ДИАГНОСТИКА СЕТЕВЫХ ЭФФЕКТОВ")
+    print("=" * 40)
+    
+    diagnostics = {}
+    
+    # Корреляционный анализ
+    network_vars = ['visit', 'exposure']
+    corr_matrix = data[['treatment', 'conversion'] + network_vars].corr()
+    
+    print("📊 Корреляционная матрица:")
+    print(corr_matrix.round(4))
+    
+    diagnostics['correlation_matrix'] = corr_matrix
+    
+    return diagnostics
+
+
 class NetworkWeightedOutcomeEstimation:
     """
     Класс для анализа Network-based Weighted Outcome Estimation (NWOE)
@@ -604,7 +1595,7 @@ def quick_nwoe_analysis(data: pd.DataFrame, sample_size: int = 100000) -> Dict:
 
 
 # eda
-#+
+# ..
 def comprehensive_eda_for_ate_analysis(df):
     """
     Комплексный EDA анализ для подготовки к NWOE и NIV анализу ATE
@@ -762,7 +1753,7 @@ def comprehensive_eda_for_ate_analysis(df):
         else:
             print(f"    ⚠️  Слабый инструмент")
 
-#+# 1 + статистика
+# ..1 + статистика
 def basic_eda_analysis(df, remove_duplicates=True, verbose=True):
     """
     Выполняет базовый анализ данных (EDA)
@@ -963,7 +1954,7 @@ class OutlierAnalyzer:#+
                 'max': float(data.max())
             }
         }
-    
+    # ..
     def generate_report(self):
         """
         Генерация отчета по выбросам
