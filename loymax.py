@@ -1,44 +1,46 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy import stats
-from scipy.stats import pearsonr
-from sklearn.preprocessing import RobustScaler, StandardScaler
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.model_selection import cross_val_score
-from sklearn.metrics import r2_score
-from sklearn.decomposition import PCA
-from statsmodels.stats.weightstats import ttest_ind
-from pylift.eval import UpliftEval
-import loymax as lm
-from typing import Dict, Tuple, List
+# Standard libraries
+from typing import Dict, List, Optional, Tuple
 import warnings
-warnings.filterwarnings('ignore')
+
+# Data manipulation and analysis
 import pandas as pd
 import numpy as np
+
+# Visualization
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+# Statistical analysis
 from scipy import stats
 from scipy.stats import pearsonr
-from sklearn.preprocessing import RobustScaler, StandardScaler
-from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
-from sklearn.model_selection import cross_val_score, train_test_split
-from sklearn.metrics import r2_score, mean_squared_error, accuracy_score
-from sklearn.decomposition import PCA
 from statsmodels.stats.weightstats import ttest_ind
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools.tools import add_constant
-from typing import Dict, Tuple, List
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple
-from sklearn.preprocessing import StandardScaler
+
+# Machine learning
+from sklearn.preprocessing import RobustScaler, StandardScaler
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.ensemble import RandomForestRegressor
-from scipy import stats
+from sklearn.ensemble import (
+    RandomForestRegressor, 
+    RandomForestClassifier
+)
+from sklearn.model_selection import (
+    cross_val_score, 
+    train_test_split
+)
+from sklearn.metrics import (
+    r2_score, 
+    mean_squared_error, 
+    accuracy_score
+)
+from sklearn.decomposition import PCA
+
+# Specialized libraries
+import loymax as lm
+from pylift.eval import UpliftEval
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
 
 # Попытка импорта pylift с обработкой ошибок
 try:
@@ -64,7 +66,144 @@ try:
 except ImportError:
     STATSMODELS_AVAILABLE = False
     print("⚠️ Statsmodels не установлен. Используем альтернативные методы.")
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
 
+# 1. НАХОДИМ ПЕРИОДЫ СКРЫТЫХ АКЦИЙ
+def find_hidden_campaigns(purchases):
+    """Ищем аномальные дни по начислениям на карты"""
+    daily_stats = purchases.groupby(purchases['Opetation_datetime'].dt.date).agg({
+        'toCard_stand': 'sum',
+        'fromCard_stand': 'sum',
+        'Person_BKEY': 'nunique',
+        'Amount_Cheque': 'sum'
+    }).reset_index()
+    
+    # Находим выбросы (топ 5% дней по начислениям)
+    threshold = daily_stats['toCard_stand'].quantile(0.95)
+    campaign_days = daily_stats[daily_stats['toCard_stand'] > threshold]['Opetation_datetime']
+    
+    return campaign_days.tolist(), daily_stats
+
+# 2. АНАЛИЗ ИЗМЕНЕНИЙ В ПОКУПКАХ
+def analyze_purchase_changes(purchases, goods, campaign_days):
+    """Сравниваем поведение до/во время/после кампаний"""
+    
+    results = []
+    
+    for campaign_day in campaign_days[:3]:  # Берем первые 3 кампании
+        
+        # Определяем периоды
+        before_start = campaign_day - timedelta(days=7)
+        before_end = campaign_day - timedelta(days=1)
+        during_start = campaign_day
+        during_end = campaign_day + timedelta(days=3)
+        after_start = during_end + timedelta(days=1)
+        after_end = after_start + timedelta(days=7)
+        
+        # Фильтруем данные по периодам
+        periods = {
+            'before': (before_start, before_end),
+            'during': (during_start, during_end), 
+            'after': (after_start, after_end)
+        }
+        
+        for period_name, (start, end) in periods.items():
+            mask = (purchases['Opetation_datetime'].dt.date >= start) & \
+                   (purchases['Opetation_datetime'].dt.date <= end)
+            
+            period_data = purchases[mask].merge(goods, on='Goods_BKEY', how='left')
+            
+            # Считаем метрики
+            metrics = {
+                'campaign_date': campaign_day,
+                'period': period_name,
+                'unique_customers': period_data['Person_BKEY'].nunique(),
+                'avg_basket_size': period_data.groupby('Purchase_ID')['Qnt'].sum().mean(),
+                'avg_cheque': period_data['Amount_Cheque'].mean(),
+                'unique_products': period_data['Goods_BKEY'].nunique(),
+                'unique_categories': period_data['cat_lev_02_BKEY'].nunique()
+            }
+            
+            results.append(metrics)
+    
+    return pd.DataFrame(results)
+
+# 3. ТОП ИЗМЕНЕНИЯ В КАТЕГОРИЯХ
+def analyze_category_shifts(purchases, goods, campaign_days):
+    """Какие категории больше всего меняются во время кампаний"""
+    
+    category_changes = []
+    
+    for campaign_day in campaign_days[:2]:
+        # До кампании
+        before_mask = (purchases['Opetation_datetime'].dt.date >= campaign_day - timedelta(days=7)) & \
+                     (purchases['Opetation_datetime'].dt.date < campaign_day)
+        
+        # Во время кампании  
+        during_mask = (purchases['Opetation_datetime'].dt.date >= campaign_day) & \
+                     (purchases['Opetation_datetime'].dt.date <= campaign_day + timedelta(days=3))
+        
+        before_data = purchases[before_mask].merge(goods, on='Goods_BKEY')
+        during_data = purchases[during_mask].merge(goods, on='Goods_BKEY')
+        
+        # Считаем долю каждой категории
+        before_cat = before_data.groupby('cat_lev_02_BKEY')['Amount'].sum()
+        during_cat = during_data.groupby('cat_lev_02_BKEY')['Amount'].sum()
+        
+        before_pct = before_cat / before_cat.sum() * 100
+        during_pct = during_cat / during_cat.sum() * 100
+        
+        # Находим наибольшие изменения
+        change = during_pct - before_pct
+        top_changes = change.abs().nlargest(5)
+        
+        for cat, change_val in top_changes.items():
+            category_changes.append({
+                'campaign_date': campaign_day,
+                'category': cat,
+                'change_percent': change_val,
+                'before_share': before_pct.get(cat, 0),
+                'during_share': during_pct.get(cat, 0)
+            })
+    
+    return pd.DataFrame(category_changes)
+
+# 4. ВИЗУАЛИЗАЦИЯ
+def create_visualizations(daily_stats, analysis_results, category_changes):
+    """Создаем простые графики"""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    
+    # График 1: Динамика начислений (поиск кампаний)
+    axes[0,0].plot(daily_stats['Opetation_datetime'], daily_stats['toCard_stand'])
+    axes[0,0].set_title('Начисления на карты по дням (пики = скрытые акции)')
+    axes[0,0].tick_params(axis='x', rotation=45)
+    
+    # График 2: Изменение среднего чека по периодам
+    period_order = ['before', 'during', 'after']
+    avg_by_period = analysis_results.groupby('period')['avg_cheque'].mean().reindex(period_order)
+    axes[0,1].bar(avg_by_period.index, avg_by_period.values)
+    axes[0,1].set_title('Средний чек: до/во время/после кампаний')
+    
+    # График 3: Размер корзины
+    basket_by_period = analysis_results.groupby('period')['avg_basket_size'].mean().reindex(period_order)
+    axes[1,0].bar(basket_by_period.index, basket_by_period.values)
+    axes[1,0].set_title('Размер корзины: до/во время/после')
+    
+    # График 4: Топ изменений категорий
+    if not category_changes.empty:
+        top_cats = category_changes.nlargest(5, 'change_percent')
+        axes[1,1].barh(range(len(top_cats)), top_cats['change_percent'])
+        axes[1,1].set_yticks(range(len(top_cats)))
+        axes[1,1].set_yticklabels([f'Cat_{int(x)}' for x in top_cats['category']])
+        axes[1,1].set_title('Топ изменений категорий (%)')
+    
+    plt.tight_layout()
+    plt.show()
 
 class ATENIVAnalyzer:
     """
